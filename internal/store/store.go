@@ -1,9 +1,9 @@
 // Package store 是 PostgreSQL 存储层。
 //
-// 并发控制的关键在 CommitGeneration：
-// 先 SELECT ... FOR UPDATE 锁住 rollout_state 单行，再核对 expected_gen，
+// 并发控制的关键在 CommitGeneration / ReportFault：
+// 先 SELECT ... FOR UPDATE 锁住 rollout_state 单行，再核对 expected_gen 或所见 gen，
 // 然后在同一事务里写 generation、推进指针。两个 API 实例同时提交时，
-// 后拿到行锁的事务会看到已推进的代次，因 expected_gen 过期而 409。
+// 后拿到行锁的事务会看到已推进的代次，因预期代次过期而 409。
 package store
 
 import (
@@ -12,9 +12,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"configrelease/internal/config"
+	"configrelease/internal/hash"
 	"configrelease/internal/semver"
 
 	"github.com/lib/pq"
@@ -32,6 +34,10 @@ var (
 	ErrPackageNotFound = errors.New("package not found")
 	// ErrGenerationNotFound 指定的代次不存在。
 	ErrGenerationNotFound = errors.New("generation not found")
+	// ErrClientIncompatible 上报版本不满足所见代次的最低客户端版本。
+	ErrClientIncompatible = errors.New("client version incompatible with generation")
+	// ErrClientNotInTrial 按所见代次的分桶与试用比例复核，客户端未命中试用。
+	ErrClientNotInTrial = errors.New("client was not in the generation trial")
 )
 
 // Store 包装数据库句柄。
@@ -76,30 +82,48 @@ type GenerationView struct {
 	MinVersion     semver.Version  `json:"-"`
 	MinVersionText string          `json:"min_client_version"`
 	RollbackFrom   *int64          `json:"rollback_from,omitempty"`
+	FaultFrom      *int64          `json:"fault_from,omitempty"`
+	FaultReports   []FaultReport   `json:"-"`
 	CreatedAt      time.Time       `json:"created_at"`
 	Content        config.Snapshot `json:"snapshot"`
 }
 
+// FaultReport 是某客户端针对其确实命中的试用代次提交的不可变故障记录。
+type FaultReport struct {
+	ID                int64          `json:"id"`
+	Gen               int64          `json:"gen"`
+	ClientID          string         `json:"client_id"`
+	ClientVersion     semver.Version `json:"-"`
+	ClientVersionText string         `json:"client_version"`
+	Bucket            int            `json:"bucket"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
 const genColumns = `g.gen, g.pkg, g.kind, g.trial_percent,
     g.min_major, g.min_minor, g.min_patch, g.min_version_text,
-    g.rollback_from, g.created_at, p.content`
+    g.rollback_from, g.fault_from, g.created_at, p.content`
 
 func scanGen(row interface {
 	Scan(dest ...any) error
 }) (GenerationView, error) {
 	var v GenerationView
 	var rollback sql.NullInt64
+	var faultFrom sql.NullInt64
 	var content []byte
 	if err := row.Scan(
 		&v.Gen, &v.Package, &v.Kind, &v.TrialPercent,
 		&v.MinVersion.Major, &v.MinVersion.Minor, &v.MinVersion.Patch, &v.MinVersionText,
-		&rollback, &v.CreatedAt, &content,
+		&rollback, &faultFrom, &v.CreatedAt, &content,
 	); err != nil {
 		return GenerationView{}, err
 	}
 	if rollback.Valid {
 		rf := rollback.Int64
 		v.RollbackFrom = &rf
+	}
+	if faultFrom.Valid {
+		ff := faultFrom.Int64
+		v.FaultFrom = &ff
 	}
 	if err := json.Unmarshal(content, &v.Content); err != nil {
 		return GenerationView{}, fmt.Errorf("decode package %d: %w", v.Package, err)
@@ -231,7 +255,13 @@ func (s *Store) Current(ctx context.Context) (GenerationView, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return GenerationView{}, ErrNoCurrent
 	}
-	return v, err
+	if err != nil {
+		return GenerationView{}, err
+	}
+	if err := s.attachFaultReports(ctx, &v); err != nil {
+		return GenerationView{}, err
+	}
+	return v, nil
 }
 
 // ListGenerations 返回全部发布记录（按代次升序），每条都带完整快照。
@@ -253,6 +283,9 @@ func (s *Store) ListGenerations(ctx context.Context) ([]GenerationView, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := s.attachFaultReports(ctx, &v); err != nil {
+			return nil, err
+		}
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -269,7 +302,64 @@ func (s *Store) GetGeneration(ctx context.Context, gen int64) (GenerationView, e
 	if errors.Is(err, sql.ErrNoRows) {
 		return GenerationView{}, ErrGenerationNotFound
 	}
-	return v, err
+	if err != nil {
+		return GenerationView{}, err
+	}
+	if err := s.attachFaultReports(ctx, &v); err != nil {
+		return GenerationView{}, err
+	}
+	return v, nil
+}
+
+const faultReportColumns = `id, gen, client_id,
+    client_major, client_minor, client_patch, client_version_text,
+    bucket, created_at`
+
+func scanFaultReport(row interface{ Scan(dest ...any) error }) (FaultReport, error) {
+	var r FaultReport
+	if err := row.Scan(
+		&r.ID, &r.Gen, &r.ClientID,
+		&r.ClientVersion.Major, &r.ClientVersion.Minor, &r.ClientVersion.Patch,
+		&r.ClientVersionText, &r.Bucket, &r.CreatedAt,
+	); err != nil {
+		return FaultReport{}, err
+	}
+	return r, nil
+}
+
+// ListFaultReports 返回某一代次已复核通过的故障上报，按登记顺序排列。
+func (s *Store) ListFaultReports(ctx context.Context, gen int64) ([]FaultReport, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+        SELECT %s
+        FROM fault_reports
+        WHERE gen = $1
+        ORDER BY id ASC`, faultReportColumns), gen)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []FaultReport
+	for rows.Next() {
+		r, err := scanFaultReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) attachFaultReports(ctx context.Context, v *GenerationView) error {
+	if v.FaultFrom == nil {
+		return nil
+	}
+	reports, err := s.ListFaultReports(ctx, *v.FaultFrom)
+	if err != nil {
+		return err
+	}
+	v.FaultReports = reports
+	return nil
 }
 
 // LatestCompatibleBefore 返回 genBefore 之前（不含）的“回退目标”：
@@ -299,13 +389,14 @@ func (s *Store) LatestCompatibleBefore(ctx context.Context, clientVer semver.Ver
 	return v, err
 }
 
-// CommitInput 描述一次代次提交（publish / adjust / rollback 共用）。
+// CommitInput 描述一次代次提交（publish / adjust / rollback / fault_disable 共用）。
 type CommitInput struct {
-	Kind         string         // publish | adjust | rollback
+	Kind         string         // publish | adjust | rollback | fault_disable
 	Pkg          int64          // 该代次指向的完整包
 	TrialPercent int            // 0..100
 	MinVersion   semver.Version // 最低客户端版本
 	RollbackFrom *int64         // 仅 rollback：回滚来源代次
+	FaultFrom    *int64         // 仅 fault_disable：触发停用的故障上报所属代次
 	ExpectedGen  int64          // 提交者预期的当前代次；首次发布传 0
 }
 
@@ -395,12 +486,12 @@ func (s *Store) insertGeneration(ctx context.Context, tx *sql.Tx, in CommitInput
 	err := tx.QueryRowContext(ctx, `
         INSERT INTO generations
             (pkg, kind, trial_percent, min_major, min_minor, min_patch,
-             min_version_text, rollback_from)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             min_version_text, rollback_from, fault_from)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING gen`,
 		in.Pkg, in.Kind, in.TrialPercent,
 		in.MinVersion.Major, in.MinVersion.Minor, in.MinVersion.Patch,
-		in.MinVersion.String(), in.RollbackFrom).Scan(&newGen)
+		in.MinVersion.String(), in.RollbackFrom, in.FaultFrom).Scan(&newGen)
 	if err != nil {
 		return 0, mapPqError(err)
 	}
@@ -413,10 +504,14 @@ func mapPqError(err error) error {
 	if errors.As(err, &pqErr) {
 		switch pqErr.Code {
 		case "23503": // foreign_key_violation
-			if pqErr.Constraint == "generations_rollback_from_fkey" {
+			switch {
+			case pqErr.Constraint == "generations_rollback_from_fkey":
 				return ErrGenerationNotFound
+			case strings.Contains(pqErr.Constraint, "fault_from"):
+				return ErrGenerationNotFound
+			default:
+				return ErrPackageNotFound
 			}
-			return ErrPackageNotFound
 		case "40001", "40P01": // serialization failure / deadlock
 			return ErrConflict
 		}
@@ -424,9 +519,200 @@ func mapPqError(err error) error {
 	return err
 }
 
+// FaultTriggerThreshold 是同一发布代次触发自动停用所需的不同有效客户端数。
+const FaultTriggerThreshold = 3
+
+// FaultReportInput 是客户端提交的故障见证。
+type FaultReportInput struct {
+	Gen       int64
+	ClientID  string
+	Version   semver.Version
+}
+
+// FaultReportResult 返回登记结果；第三个不同客户端上报时 Generation 为新代次。
+type FaultReportResult struct {
+	Created    bool
+	Report     FaultReport
+	Count      int
+	Threshold  int
+	Triggered  bool
+	Generation GenerationView
+}
+
+// ReportFault 按代次登记一个试用故障客户端。
+//
+// 整个方法在一个事务里完成：锁当前指针、复核该客户端确实按所见代次的分桶和
+// 兼容规则取得试用包、幂等登记见证；达到阈值时在同一事务追加 fault_disable
+// 代次并推进当前指针。与人工 publish/adjust/rollback 共用 rollout_state 行锁，
+// 因此交错写操作由数据库裁决唯一先后顺序。
+func (s *Store) ReportFault(ctx context.Context, in FaultReportInput) (FaultReportResult, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currentGen int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT current_gen FROM rollout_state WHERE id = 1 FOR UPDATE`).
+		Scan(&currentGen); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FaultReportResult{}, ErrNoCurrent
+		}
+		return FaultReportResult{}, err
+	}
+	// 所见代次必须仍是当前代次；旧代次上报只可能重放历史，不能触发处置。
+	if currentGen != in.Gen {
+		return FaultReportResult{}, ErrConflict
+	}
+
+	var (
+		pkg                         int64
+		trialPercent                int
+		major, minorV, patch        int64
+	)
+	err = tx.QueryRowContext(ctx, `
+        SELECT pkg, trial_percent, min_major, min_minor, min_patch
+        FROM generations
+        WHERE gen = $1`, in.Gen).Scan(&pkg, &trialPercent, &major, &minorV, &patch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultReportResult{}, ErrGenerationNotFound
+	}
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	observedMin := semver.Version{Major: major, Minor: minorV, Patch: patch}
+
+	// 服务端必须用该代次自己的规则复核，不能相信客户端声称“我拿到了试用包”。
+	if !semver.GTE(in.Version, observedMin) {
+		return FaultReportResult{}, ErrClientIncompatible
+	}
+	bucket := int(hash.Bucket(in.ClientID))
+	if !hash.InTrial(uint64(bucket), trialPercent) {
+		return FaultReportResult{}, ErrClientNotInTrial
+	}
+
+	report := FaultReport{
+		Gen:               in.Gen,
+		ClientID:          in.ClientID,
+		ClientVersion:     in.Version,
+		ClientVersionText: in.Version.String(),
+		Bucket:            bucket,
+	}
+	insertErr := tx.QueryRowContext(ctx, `
+        INSERT INTO fault_reports
+            (gen, client_id, client_major, client_minor, client_patch,
+             client_version_text, bucket)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (gen, client_id) DO NOTHING
+        RETURNING id, created_at`,
+		in.Gen, in.ClientID,
+		in.Version.Major, in.Version.Minor, in.Version.Patch,
+		in.Version.String(), bucket).
+		Scan(&report.ID, &report.CreatedAt)
+	if errors.Is(insertErr, sql.ErrNoRows) {
+		// 同一客户端对同一代次重复上报只计一次；不产生新记录，也绝不再触发处置。
+		existing, err := faultReportInTx(ctx, tx, in.Gen, in.ClientID)
+		if err != nil {
+			return FaultReportResult{}, err
+		}
+		count, err := countFaultReportsInTx(ctx, tx, in.Gen)
+		if err != nil {
+			return FaultReportResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return FaultReportResult{}, mapPqError(err)
+		}
+		return FaultReportResult{
+			Created:   false,
+			Report:    existing,
+			Count:     count,
+			Threshold: FaultTriggerThreshold,
+		}, nil
+	}
+	if insertErr != nil {
+		return FaultReportResult{}, mapPqError(insertErr)
+	}
+
+	count, err := countFaultReportsInTx(ctx, tx, in.Gen)
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	result := FaultReportResult{
+		Created:   true,
+		Report:    report,
+		Count:     count,
+		Threshold: FaultTriggerThreshold,
+	}
+
+	if count == FaultTriggerThreshold {
+		// 第三个不同有效客户端：故障记录与新代次必须同事务提交。
+		faultFrom := in.Gen
+		newGen, err := s.insertGeneration(ctx, tx, CommitInput{
+			Kind:         "fault_disable",
+			Pkg:          pkg,
+			TrialPercent: 0,
+			MinVersion:   observedMin,
+			FaultFrom:    &faultFrom,
+			ExpectedGen:  currentGen,
+		})
+		if err != nil {
+			return FaultReportResult{}, err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE rollout_state SET current_gen = $1
+             WHERE id = 1 AND current_gen = $2`,
+			newGen, currentGen)
+		if err != nil {
+			return FaultReportResult{}, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return FaultReportResult{}, ErrConflict
+		}
+		result.Triggered = true
+		if err := tx.Commit(); err != nil {
+			return FaultReportResult{}, mapPqError(err)
+		}
+		generation, err := s.GetGeneration(ctx, newGen)
+		if err != nil {
+			return FaultReportResult{}, err
+		}
+		result.Generation = generation
+		return result, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return FaultReportResult{}, mapPqError(err)
+	}
+	return result, nil
+}
+
+func faultReportInTx(ctx context.Context, tx *sql.Tx, gen int64, clientID string) (FaultReport, error) {
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+        SELECT %s
+        FROM fault_reports
+        WHERE gen = $1 AND client_id = $2`, faultReportColumns), gen, clientID)
+	r, err := scanFaultReport(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultReport{}, sql.ErrNoRows
+	}
+	return r, err
+}
+
+func countFaultReportsInTx(ctx context.Context, tx *sql.Tx, gen int64) (int, error) {
+	var count int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM fault_reports WHERE gen = $1`, gen).
+		Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // ResetForTest 清空全部业务表并复位序列，仅供 verify 测试使用。
 func (s *Store) ResetForTest(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
-        TRUNCATE TABLE rollout_state, generations, packages, drafts RESTART IDENTITY CASCADE`)
+        TRUNCATE TABLE rollout_state, fault_reports, generations, packages, drafts
+        RESTART IDENTITY CASCADE`)
 	return err
 }

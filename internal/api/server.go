@@ -47,14 +47,16 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /v1/packages", s.freezePackage)
 	m.HandleFunc("GET /v1/packages/{pkg}", s.getPackage)
 
-	// 发布代次：三种提交都带 expected_gen。
+	// 发布代次：三种提交都带 expected_gen；故障上报达到阈值时也只追加新代次。
 	m.HandleFunc("POST /v1/publish", s.publish)
 	m.HandleFunc("POST /v1/adjust", s.adjust)
 	m.HandleFunc("POST /v1/rollback", s.rollback)
+	m.HandleFunc("POST /v1/fault-reports", s.reportFault)
 
 	m.HandleFunc("GET /v1/current", s.current)
 	m.HandleFunc("GET /v1/generations", s.listGenerations)
 	m.HandleFunc("GET /v1/generations/{gen}", s.getGeneration)
+	m.HandleFunc("GET /v1/generations/{gen}/fault-reports", s.listFaultReports)
 
 	// 客户端解析：稳定哈希分组 + 旧版本回退。
 	m.HandleFunc("GET /v1/resolve", s.resolveConfig)
@@ -319,6 +321,83 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, genResponse(gen))
+}
+
+func (s *Server) reportFault(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ClientID      string `json:"client_id"`
+		ClientVersion string `json:"client_version"`
+		Gen           int64  `json:"gen"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+
+	ve := &validationErrs{}
+	if body.ClientID == "" {
+		ve.add("client_id", "is required")
+	}
+	if body.Gen <= 0 {
+		ve.add("gen", "must be a positive observed generation")
+	}
+	ver, msg := parseSemVer(body.ClientVersion)
+	if msg != "" {
+		ve.add("client_version", msg)
+	}
+	if !ve.flush(w) {
+		return
+	}
+
+	result, err := s.store.ReportFault(r.Context(), store.FaultReportInput{
+		Gen:      body.Gen,
+		ClientID: body.ClientID,
+		Version:  ver,
+	})
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+
+	status := http.StatusCreated
+	if !result.Created {
+		// 幂等：同一客户端、同一代次重复上报返回 200，并明确没有新增计数。
+		status = http.StatusOK
+	}
+	resp := map[string]any{
+		"created":    result.Created,
+		"duplicate":  !result.Created,
+		"report":     faultReportResponse(result.Report),
+		"count":      result.Count,
+		"threshold":  result.Threshold,
+		"triggered":  result.Triggered,
+	}
+	if result.Triggered {
+		// 展示停用处置的新代次以及触发它的完整故障依据。
+		resp["generation"] = genResponse(result.Generation)
+	}
+	writeJSON(w, status, resp)
+}
+
+func (s *Server) listFaultReports(w http.ResponseWriter, r *http.Request) {
+	gen, ok := pathInt64(w, r, "gen")
+	if !ok {
+		return
+	}
+	// 先确认代次存在；未知代次不能伪装成“尚无上报”。
+	if _, err := s.store.GetGeneration(r.Context(), gen); err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	reports, err := s.store.ListFaultReports(r.Context(), gen)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"gen":           gen,
+		"count":         len(reports),
+		"fault_reports": faultReportsResponse(reports),
+	})
 }
 
 func (s *Server) current(w http.ResponseWriter, r *http.Request) {

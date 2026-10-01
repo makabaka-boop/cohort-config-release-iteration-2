@@ -16,16 +16,43 @@ import (
 // genResponse 是发布代次的统一对外形态：代次元信息 + 完整包快照。
 // 任何读到代次的接口都拿到同一结构，杜绝“新路由配旧限额”。
 func genResponse(g store.GenerationView) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"gen":                g.Gen,
 		"kind":               g.Kind,
 		"package":            g.Package,
 		"trial_percent":      g.TrialPercent,
 		"min_client_version": g.MinVersion.String(),
-		"rollback_from":      g.RollbackFrom,
 		"created_at":         g.CreatedAt,
 		"snapshot":           g.Content,
 	}
+	// rollback_from 保持既有响应形态；非回滚代次仍返回 null。
+	out["rollback_from"] = g.RollbackFrom
+	if g.FaultFrom != nil {
+		out["fault_from"] = *g.FaultFrom
+	}
+	if len(g.FaultReports) > 0 {
+		out["fault_reports"] = faultReportsResponse(g.FaultReports)
+	}
+	return out
+}
+
+func faultReportResponse(r store.FaultReport) map[string]any {
+	return map[string]any{
+		"id":             r.ID,
+		"gen":            r.Gen,
+		"client_id":      r.ClientID,
+		"client_version": r.ClientVersion.String(),
+		"bucket":         r.Bucket,
+		"created_at":     r.CreatedAt,
+	}
+}
+
+func faultReportsResponse(reports []store.FaultReport) []map[string]any {
+	out := make([]map[string]any, 0, len(reports))
+	for _, r := range reports {
+		out = append(out, faultReportResponse(r))
+	}
+	return out
 }
 
 // validationErrs 累积请求字段错误。
@@ -116,6 +143,12 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, store.ErrNoCurrent):
 		writeAppError(w, http.StatusServiceUnavailable, "no_current",
 			"no configuration has been published yet")
+	case errors.Is(err, store.ErrClientIncompatible):
+		writeAppError(w, http.StatusUnprocessableEntity, "client_incompatible",
+			"client version does not satisfy the observed generation's minimum version")
+	case errors.Is(err, store.ErrClientNotInTrial):
+		writeAppError(w, http.StatusUnprocessableEntity, "client_not_in_trial",
+			"bucket and rollout rules show that this client did not receive the trial package")
 	case errors.Is(err, store.ErrConflict):
 		writeAppError(w, http.StatusConflict, "generation_conflict",
 			"expected_gen does not match the current generation; refetch and retry")

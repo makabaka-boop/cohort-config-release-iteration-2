@@ -5,9 +5,9 @@
 
 - 草稿先通过**跨组引用校验**（每条 route 的 `limit_id` 必须在 limits 中存在），
   才能冻结成**不可变包（package）**；包一经写入不可修改、不可删除。
-- 发布（publish）、调比例（adjust）、回滚（rollback）都创建**新的发布代次（generation）**，
-  每次写操作必须携带 `expected_gen`；两个 API 实例同时提交时只有一个能成功，
-  另一方收到 `409 generation_conflict`。
+- 发布、调比例、回滚以及试用故障自动停用都创建**新的发布代次（generation）**，
+  每次写操作必须携带 `expected_gen`（故障上报携带所见 `gen`）；两个 API 实例
+  同时提交时只有一个能成功，另一方收到 `409 generation_conflict`。
 - 发布时声明 **0～100% 试用比例**与**最低客户端版本**。
   客户端按 `FNV-1a/64(client_id) mod 100` 稳定分桶：
   多实例一致、重启后不变，调整比例只移动阈值、不重排客户端。
@@ -99,6 +99,42 @@ curl -s -XPOST localhost:8080/v1/rollback -d '{
   "gen": 1, "trial_percent": 100, "expected_gen": 2}'
 ```
 
+### 试用故障上报与自动停用
+
+```bash
+# 客户端提交自己的 ID、版本和“亲眼见到”的发布代次。
+curl -s -XPOST localhost:8080/v1/fault-reports -d '{
+  "client_id": "phone-123",
+  "client_version": "1.5.0",
+  "gen": 2}'
+```
+
+服务端不会直接相信客户端声称自己拿到试用包，而会在事务中用 `gen=2` 的
+试用比例、FNV 分桶和最低版本重新复核：
+
+- 旧代次（不是当前代次）：`409 generation_conflict`，不登记；
+- 版本不满足该代次最低版本：`422 client_incompatible`，不登记；
+- 桶未命中该代次试用比例：`422 client_not_in_trial`，不登记；
+- 同一 `(gen, client_id)` 重复上报：`200 {"created":false,"duplicate":true}`，只计一次。
+
+同一代次收到第三个**不同**的有效客户端后，系统在同一个 PostgreSQL 事务内：
+
+1. 写入第三条 `fault_reports` 故障记录；
+2. 只追加一条 `kind="fault_disable"` 的新代次，包不变、`trial_percent=0`；
+3. 推进当前指针。原故障代次及任何已发布代次都不会被原地改写。
+
+停用后解析仍走既有规则：新代次的试用集合为空，客户端回退到最近的兼容旧包。
+人工调比例 / 回滚与第三份故障上报交错时，它们都在 `rollout_state` 同一行锁后
+比较当前代次；落败方收到可重试的 `409 generation_conflict`，不会产生重复代次。
+
+```bash
+# 查看某代次的完整故障登记轨迹
+curl -s localhost:8080/v1/generations/2/fault-reports
+
+# fault_disable 代次的 fault_from 指向触发代次，fault_reports 给出三份依据。
+curl -s localhost:8080/v1/generations/3
+```
+
 记录与快照：
 
 ```bash
@@ -132,11 +168,12 @@ curl -s 'localhost:8080/v1/resolve?client_id=phone-123&client_version=1.5.0'
 
 ## 并发控制的实现要点
 
-`CommitGeneration` 在单个事务里：
+`CommitGeneration` 与故障自动停用在单个事务里：
 
 1. `SELECT ... FROM rollout_state WHERE id=1 FOR UPDATE` 串行化所有提交；
-2. 比对 `current_gen == expected_gen`，不一致即 `409`；
-3. 向只增不改的 `generations` 追加记录并推进指针。
+2. 比对 `current_gen == expected_gen`（故障上报比对所见 `gen`），不一致即 `409`；
+3. 向只增不改的 `generations` 追加记录并推进指针；故障停用时，同一事务先完成
+   `fault_reports` 见证写入，再追加 `fault_disable` 代次；
 4. 首次发布没有行可锁：依赖 `rollout_state` 主键的唯一插入，
    并发首发中只有一个事务能插入成功，其余得到冲突。
 
@@ -152,7 +189,10 @@ curl -s 'localhost:8080/v1/resolve?client_id=phone-123&client_version=1.5.0'
 - **比例边界**：`-1`/`101` 被拒；0% 全员回退、100% 全员当前、37% 与哈希契约逐客户端一致；
 - **重启后稳定分组**：关闭并新建 API 实例后，80 个客户端决策逐个不变，
   桶号始终等于无状态 FNV-1a 哈希；
-- 查询 / 发布记录 / 回滚三个入口读到同一完整快照。
+- 查询 / 发布记录 / 回滚三个入口读到同一完整快照；
+- **试用故障**：覆盖重复上报、版本不兼容、未命中试用、旧代次上报、第三客户端
+  触发 `fault_disable`、两实例竞争（第三上报 vs 调比例/回滚），以及注入事务失败后
+  故障见证、新代次和当前指针均无半份记录。
 
 ## 本地开发（不用 Docker）
 
