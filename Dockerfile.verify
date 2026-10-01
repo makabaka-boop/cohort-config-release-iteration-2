@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+
+# verify 是一次性测试镜像：对真实 PostgreSQL 跑完整 Go 测试套件
+# （单元测试 + 端到端集成测试），退出码即验收结果。
+FROM golang:1.22-bookworm
+WORKDIR /src
+
+# 让容器内的 go test 能访问 lib/pq。
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# 等待数据库健康由 compose 的 depends_on(service_healthy) 保证；
+# 这里直接跑全部测试。
+CMD ["go", "test", "-count=1", "-v", "./..."]

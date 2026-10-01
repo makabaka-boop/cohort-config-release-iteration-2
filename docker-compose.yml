@@ -1,0 +1,71 @@
+# 配置发布系统 —— 本地编排。
+#
+# 固定验收（依次执行）：
+#   docker compose config --quiet
+#   docker compose build
+#   docker compose run --rm verify
+#
+# 日常启动 API：
+#   docker compose up -d db api
+#   curl 'http://localhost:8080/healthz'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: configdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d configdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_DSN: postgres://postgres:postgres@db:5432/configdb?sslmode=disable
+      HTTP_ADDR: :8080
+    ports:
+      # 区间与 scale:2 对应：两个副本分别拿到宿主 8080 / 8081。
+      - target: 8080
+        published: "8080-8081"
+        protocol: tcp
+        mode: host
+    depends_on:
+      db:
+        condition: service_healthy
+    # 起两个副本，验证多个 API 实例共享同一发布代次与并发提交控制。
+    scale: 2
+    healthcheck:
+      test: ["CMD", "/server", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # 一次性验收服务：对真实数据库跑全部测试（含并发发布、旧客户端回退、
+  # 比例边界、重启稳定分组），退出码非零即验收失败。
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    environment:
+      # 指向 compose 网络内的 db；测试套件自建/重置 configverify 库。
+      TEST_DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
+      TEST_DB_NAME: configverify
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
