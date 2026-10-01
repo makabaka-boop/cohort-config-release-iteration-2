@@ -1,9 +1,9 @@
 // Package store 是 PostgreSQL 存储层。
 //
-// 并发控制的关键在 CommitGeneration：
-// 先 SELECT ... FOR UPDATE 锁住 rollout_state 单行，再核对 expected_gen，
+// 并发控制的关键在 CommitGeneration / ReportFault：
+// 先 SELECT ... FOR UPDATE 锁住 rollout_state 单行，再核对调用方所见代次，
 // 然后在同一事务里写 generation、推进指针。两个 API 实例同时提交时，
-// 后拿到行锁的事务会看到已推进的代次，因 expected_gen 过期而 409。
+// 后拿到行锁的事务会看到已推进的代次，因所见代次过期而 409。
 package store
 
 import (
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"configrelease/internal/config"
+	"configrelease/internal/hash"
 	"configrelease/internal/semver"
 
 	"github.com/lib/pq"
@@ -32,6 +33,10 @@ var (
 	ErrPackageNotFound = errors.New("package not found")
 	// ErrGenerationNotFound 指定的代次不存在。
 	ErrGenerationNotFound = errors.New("generation not found")
+	// ErrFaultReportInvalid 上报客户端按其所报代次复核，并未取得该代次试用包。
+	ErrFaultReportInvalid = errors.New("fault report did not receive trial package")
+	// ErrFaultActionNotFound 指定代次没有触发过自动停用。
+	ErrFaultActionNotFound = errors.New("fault action not found")
 )
 
 // Store 包装数据库句柄。
@@ -424,9 +429,272 @@ func mapPqError(err error) error {
 	return err
 }
 
+// FaultReportInput 是客户端按自己实际见到的发布代次提交的故障证据。
+type FaultReportInput struct {
+	ObservedGen int64
+	ClientID    string
+	Version     semver.Version
+}
+
+// FaultReport 是服务端复核通过后登记的一条故障客户端记录。
+type FaultReport struct {
+	ID          int64     `json:"id"`
+	Gen         int64     `json:"gen"`
+	ClientID    string    `json:"client_id"`
+	VersionText string    `json:"client_version"`
+	Bucket      int       `json:"bucket"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// FaultAction 记录自动停用的触发依据与新追加的 0% 代次。
+type FaultAction struct {
+	TriggerGen    int64          `json:"trigger_gen"`
+	NewGen        int64          `json:"new_gen"`
+	ThirdReportID int64          `json:"third_report_id"`
+	CreatedAt     time.Time      `json:"created_at"`
+	NewGeneration GenerationView `json:"new_generation"`
+	Reports       []FaultReport  `json:"reports"`
+}
+
+// FaultReportResult 返回本次登记结果。Duplicate=true 表示同一客户端此前已登记。
+type FaultReportResult struct {
+	Report    FaultReport  `json:"report"`
+	Duplicate bool         `json:"duplicate"`
+	Triggered bool         `json:"triggered"`
+	Action    *FaultAction `json:"fault_action,omitempty"`
+}
+
+const faultReportColumns = `fr.id, fr.gen, fr.client_id, fr.client_version_text, fr.bucket, fr.created_at`
+
+func scanFaultReport(row interface {
+	Scan(dest ...any) error
+}) (FaultReport, error) {
+	var r FaultReport
+	if err := row.Scan(&r.ID, &r.Gen, &r.ClientID, &r.VersionText, &r.Bucket, &r.CreatedAt); err != nil {
+		return FaultReport{}, err
+	}
+	return r, nil
+}
+
+// ReportFault 在一个事务中登记故障，并在第三个不同有效客户端上报时原子追加停用代次。
+//
+// rollout_state 行锁串行化故障上报与 publish/adjust/rollback：
+// 先确认 observed_gen 仍是当前代次，再用该代次自己的最低版本和试用比例复核。
+// 只有版本兼容且分桶命中的客户端会写入 fault_reports；旧代次上报得到 ErrConflict，
+// 未取得试用包的上报得到 ErrFaultReportInvalid。
+func (s *Store) ReportFault(ctx context.Context, in FaultReportInput) (FaultReportResult, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currentGen int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT current_gen FROM rollout_state WHERE id = 1 FOR UPDATE`).Scan(&currentGen); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FaultReportResult{}, ErrNoCurrent
+		}
+		return FaultReportResult{}, err
+	}
+	if currentGen != in.ObservedGen {
+		return FaultReportResult{}, ErrConflict
+	}
+
+	target, err := scanGen(tx.QueryRowContext(ctx, fmt.Sprintf(`
+        SELECT %s
+        FROM generations g
+        JOIN packages p ON p.pkg = g.pkg
+        WHERE g.gen = $1`, genColumns), in.ObservedGen))
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultReportResult{}, ErrGenerationNotFound
+	}
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+
+	bucket := hash.Bucket(in.ClientID)
+
+	// 必须按“所见代次”的规则复核，而不是按上报版本/客户端自述信任。
+	if !semver.GTE(in.Version, target.MinVersion) || !hash.InTrial(bucket, target.TrialPercent) {
+		return FaultReportResult{}, ErrFaultReportInvalid
+	}
+
+	var report FaultReport
+	err = scanFaultReport(tx.QueryRowContext(ctx, `
+        INSERT INTO fault_reports
+            (gen, client_id, client_major, client_minor, client_patch,
+             client_version_text, bucket)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (gen, client_id) DO NOTHING
+        RETURNING `+faultReportColumns,
+		in.ObservedGen, in.ClientID,
+		in.Version.Major, in.Version.Minor, in.Version.Patch,
+		in.Version.String(), int(bucket)))
+	if errors.Is(err, sql.ErrNoRows) {
+		existing, getErr := s.getFaultReportInTx(ctx, tx, in.ObservedGen, in.ClientID)
+		if getErr != nil {
+			return FaultReportResult{}, getErr
+		}
+		if err := tx.Commit(); err != nil {
+			return FaultReportResult{}, mapPqError(err)
+		}
+		return FaultReportResult{Report: existing, Duplicate: true}, nil
+	}
+	if err != nil {
+		return FaultReportResult{}, mapPqError(err)
+	}
+
+	var count int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM fault_reports WHERE gen = $1`, in.ObservedGen).Scan(&count); err != nil {
+		return FaultReportResult{}, err
+	}
+
+	result := FaultReportResult{Report: report}
+	if count != 3 {
+		if err := tx.Commit(); err != nil {
+			return FaultReportResult{}, mapPqError(err)
+		}
+		return result, nil
+	}
+
+	// 第三个不同有效客户端：证据、新代次、当前指针必须同生共死。
+	newGen, err := s.insertGeneration(ctx, tx, CommitInput{
+		Kind:         "fault_disable",
+		Pkg:          target.Package,
+		TrialPercent: 0,
+		MinVersion:   target.MinVersion,
+		ExpectedGen:  currentGen,
+	})
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO fault_actions (new_gen, trigger_gen, third_report_id)
+         VALUES ($1, $2, $3)`, newGen, in.ObservedGen, report.ID); err != nil {
+		return FaultReportResult{}, mapPqError(err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO fault_action_reports (new_gen, report_id)
+         SELECT $1, id FROM fault_reports WHERE gen = $2 ORDER BY id`,
+		newGen, in.ObservedGen); err != nil {
+		return FaultReportResult{}, mapPqError(err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE rollout_state SET current_gen = $1 WHERE id = 1 AND current_gen = $2`,
+		newGen, currentGen)
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return FaultReportResult{}, ErrConflict
+	}
+
+	action, err := s.getFaultActionInTx(ctx, tx, newGen)
+	if err != nil {
+		return FaultReportResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FaultReportResult{}, mapPqError(err)
+	}
+	result.Triggered = true
+	result.Action = &action
+	return result, nil
+}
+
+func (s *Store) getFaultReportInTx(ctx context.Context, tx *sql.Tx, gen int64, clientID string) (FaultReport, error) {
+	return scanFaultReport(tx.QueryRowContext(ctx, `
+        SELECT `+faultReportColumns+`
+        FROM fault_reports fr
+        WHERE fr.gen = $1 AND fr.client_id = $2`, gen, clientID))
+}
+
+// GetFaultActionByTriggerGen 返回某代次触发自动停用时的三条证据与新代次。
+func (s *Store) GetFaultActionByTriggerGen(ctx context.Context, triggerGen int64) (FaultAction, error) {
+	var newGen int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT new_gen FROM fault_actions WHERE trigger_gen = $1`, triggerGen).Scan(&newGen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultAction{}, ErrFaultActionNotFound
+	}
+	if err != nil {
+		return FaultAction{}, err
+	}
+	return s.GetFaultAction(ctx, newGen)
+}
+
+// GetFaultAction 按自动停用产生的新代次返回触发依据。
+func (s *Store) GetFaultAction(ctx context.Context, newGen int64) (FaultAction, error) {
+	return s.getFaultActionQuery(ctx, s.db, newGen)
+}
+
+type faultActionQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func (s *Store) getFaultActionQuery(ctx context.Context, q faultActionQueryer, newGen int64) (FaultAction, error) {
+	var action FaultAction
+	var err error
+	action.NewGeneration, err = scanGen(q.QueryRowContext(ctx, fmt.Sprintf(`
+        SELECT %s
+        FROM generations g
+        JOIN packages p ON p.pkg = g.pkg
+        WHERE g.gen = $1`, genColumns), newGen))
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultAction{}, ErrGenerationNotFound
+	}
+	if err != nil {
+		return FaultAction{}, err
+	}
+
+	err = q.QueryRowContext(ctx, `
+        SELECT new_gen, trigger_gen, third_report_id, created_at
+        FROM fault_actions WHERE new_gen = $1`, newGen).
+		Scan(&action.NewGen, &action.TriggerGen, &action.ThirdReportID, &action.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FaultAction{}, ErrFaultActionNotFound
+	}
+	if err != nil {
+		return FaultAction{}, err
+	}
+
+	rows, err := q.QueryContext(ctx, `
+        SELECT `+faultReportColumns+`
+        FROM fault_action_reports far
+        JOIN fault_reports fr ON fr.id = far.report_id
+        WHERE far.new_gen = $1
+        ORDER BY fr.id`, newGen)
+	if err != nil {
+		return FaultAction{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanFaultReport(rows)
+		if err != nil {
+			return FaultAction{}, err
+		}
+		action.Reports = append(action.Reports, r)
+	}
+	if err := rows.Err(); err != nil {
+		return FaultAction{}, err
+	}
+	if len(action.Reports) != 3 {
+		return FaultAction{}, fmt.Errorf("fault action %d has %d reports, want 3", newGen, len(action.Reports))
+	}
+	return action, nil
+}
+
+func (s *Store) getFaultActionInTx(ctx context.Context, tx *sql.Tx, newGen int64) (FaultAction, error) {
+	return s.getFaultActionQuery(ctx, tx, newGen)
+}
+
 // ResetForTest 清空全部业务表并复位序列，仅供 verify 测试使用。
 func (s *Store) ResetForTest(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
-        TRUNCATE TABLE rollout_state, generations, packages, drafts RESTART IDENTITY CASCADE`)
+        TRUNCATE TABLE rollout_state, fault_action_reports, fault_actions,
+                       fault_reports, generations, packages, drafts
+        RESTART IDENTITY CASCADE`)
 	return err
 }

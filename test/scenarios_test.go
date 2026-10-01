@@ -512,6 +512,388 @@ func TestConcurrentAdjustAndRollback(t *testing.T) {
 	}
 }
 
+func TestFaultReportingDisablesTrialGeneration(t *testing.T) {
+	f := newFixture(t)
+	base := f.baseURL()
+
+	pkg1 := f.freeze(snap("v1"))
+	f.mustPublishOK(base, pkg1, 100, "1.0.0", 0)
+	pkg2 := f.freeze(snap("v2"))
+	f.mustPublishOK(base, pkg2, 10, "2.0.0", 1)
+
+	const ver = "2.0.0"
+	ids := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		ids = append(ids, "fault-client-"+itoaTest(i))
+	}
+	inTrial, outTrial := trialClients(ids, 10)
+	if len(inTrial) <= 3 || len(outTrial) == 0 {
+		t.Fatalf("test buckets degenerate: in=%d out=%d", len(inTrial), len(outTrial))
+	}
+	c1, c2, c3 := inTrial[0], inTrial[1], inTrial[2]
+	outClient := outTrial[0]
+
+	// 上报前，三个客户端确实按 gen2 的分桶与版本规则取得 pkg2。
+	for _, id := range []string{c1, c2, c3} {
+		status, d := f.resolve(base, id, ver)
+		f.mustStatus(http.StatusOK, status, d)
+		if asInt64(d["gen"]) != 2 || asInt64(d["package"]) != pkg2 || d["trial"] != true {
+			t.Fatalf("%s should receive trial gen2/pkg2: %v", id, d)
+		}
+	}
+
+	for _, id := range []string{c1, c2} {
+		status, body := f.reportFault(base, id, ver, 2)
+		f.mustStatus(http.StatusCreated, status, body)
+		if body["duplicate"] == true || body["triggered"] == true {
+			t.Fatalf("first report for %s should be new and non-triggering: %v", id, body)
+		}
+	}
+
+	// 同一客户端对同一代次重复上报只计一次。
+	status, body := f.reportFault(base, c1, ver, 2)
+	f.mustStatus(http.StatusOK, status, body)
+	if body["duplicate"] != true || body["triggered"] == true {
+		t.Fatalf("duplicate report must be idempotent: %v", body)
+	}
+	if reportCount(f, 2) != 2 {
+		t.Fatalf("duplicate report must not add a row")
+	}
+
+	// 未命中试用桶，或版本不满足所见代次要求，服务端必须拒绝且不得登记。
+	status, body = f.reportFault(base, outClient, ver, 2)
+	f.mustStatus(http.StatusUnprocessableEntity, status, body)
+	if body["error"] != "fault_report_invalid" {
+		t.Fatalf("wrong invalid bucket error: %v", body)
+	}
+	status, body = f.reportFault(base, c3, "1.0.0", 2)
+	f.mustStatus(http.StatusUnprocessableEntity, status, body)
+	if body["error"] != "fault_report_invalid" {
+		t.Fatalf("wrong incompatible version error: %v", body)
+	}
+	if reportCount(f, 2) != 2 {
+		t.Fatalf("invalid reports must not be recorded")
+	}
+
+	// 第三个不同有效客户端：同一事务写入证据并追加 0% 新代次。
+	status, body = f.reportFault(base, c3, ver, 2)
+	mustCreated(f, status, body)
+	if body["triggered"] != true || body["duplicate"] == true {
+		t.Fatalf("third valid report must trigger disable: %v", body)
+	}
+	action := body["fault_action"].(map[string]any)
+	if asInt64(action["trigger_gen"]) != 2 || asInt64(action["new_gen"]) != 3 {
+		t.Fatalf("action generations wrong: %v", action)
+	}
+	if asInt64(action["third_report_id"]) <= 0 {
+		t.Fatalf("third report id missing: %v", action)
+	}
+	reports := action["reports"].([]any)
+	if len(reports) != 3 {
+		t.Fatalf("action must preserve exactly three reports, got %d", len(reports))
+	}
+	newGen := action["new_generation"].(map[string]any)
+	if newGen["kind"] != "fault_disable" || asInt64(newGen["trial_percent"]) != 0 ||
+		asInt64(newGen["package"]) != pkg2 || newGen["min_client_version"] != "2.0.0" {
+		t.Fatalf("new generation metadata wrong: %v", newGen)
+	}
+
+	// 触发依据可通过原触发代次单独查询。
+	status, fetched := f.do(http.MethodGet, base, "/v1/generations/2/fault-action", nil)
+	f.mustStatus(http.StatusOK, status, fetched)
+	if asInt64(fetched["new_gen"]) != 3 || len(fetched["reports"].([]any)) != 3 {
+		t.Fatalf("fetched fault action wrong: %v", fetched)
+	}
+
+	// 原 gen2 未被改写；当前是新 gen3，解析沿用既有兼容回退规则拿到完整旧包。
+	status, gen2 := f.do(http.MethodGet, base, "/v1/generations/2", nil)
+	f.mustStatus(http.StatusOK, status, gen2)
+	if gen2["kind"] != "publish" || asInt64(gen2["trial_percent"]) != 10 {
+		t.Fatalf("trigger generation must remain immutable: %v", gen2)
+	}
+	status, cur := f.do(http.MethodGet, base, "/v1/current", nil)
+	f.mustStatus(http.StatusOK, status, cur)
+	if asInt64(cur["gen"]) != 3 || cur["kind"] != "fault_disable" || asInt64(cur["trial_percent"]) != 0 {
+		t.Fatalf("current generation should be 0%% fault_disable: %v", cur)
+	}
+	status, d := f.resolve(base, c3, ver)
+	f.mustStatus(http.StatusOK, status, d)
+	if asInt64(d["gen"]) != 1 || asInt64(d["package"]) != pkg1 || d["fallback"] != true {
+		t.Fatalf("after disable, trial client must fall back to old package: %v", d)
+	}
+	if asInt64(d["current_gen"]) != 3 {
+		t.Fatalf("resolve must still expose current_gen=3: %v", d)
+	}
+
+	// gen2 已成为旧代次；即使另一个命中过 gen2 的客户端补报，也必须冲突且不登记。
+	status, body = f.reportFault(base, inTrial[3], ver, 2)
+	f.mustStatus(http.StatusConflict, status, body)
+	if body["error"] != "generation_conflict" {
+		t.Fatalf("old generation report must be a retryable generation conflict: %v", body)
+	}
+	if reportCount(f, 2) != 3 {
+		t.Fatalf("stale generation report must not add evidence")
+	}
+	if countRows(f, "fault_actions") != 1 || countRows(f, "generations") != 3 {
+		t.Fatalf("triggering must create exactly one action and one generation")
+	}
+
+	// 故障证据同样是发布轨迹的一部分，数据库触发器拒绝改写或删除。
+	for _, stmt := range []string{
+		`UPDATE fault_reports SET client_id = 'mutated' WHERE gen = 2`,
+		`DELETE FROM fault_reports WHERE gen = 2`,
+		`UPDATE fault_actions SET third_report_id = 1 WHERE new_gen = 3`,
+		`DELETE FROM fault_actions WHERE new_gen = 3`,
+	} {
+		if _, err := f.db.Exec(stmt); err == nil {
+			t.Fatalf("immutability trigger must reject: %s", stmt)
+		}
+	}
+}
+
+func TestConcurrentThirdFaultReportsOnlyOneTriggers(t *testing.T) {
+	f := newFixture(t)
+	a := f.baseURL()
+	b := f.newServer()
+
+	pkg1 := f.freeze(snap("v1"))
+	f.mustPublishOK(a, pkg1, 100, "1.0.0", 0)
+	pkg2 := f.freeze(snap("v2"))
+	f.mustPublishOK(a, pkg2, 100, "1.0.0", 1)
+
+	c := []string{"race-fault-a", "race-fault-b", "race-fault-c", "race-fault-d"}
+	for _, id := range c[:2] {
+		status, body := f.reportFault(a, id, "9.0.0", 2)
+		f.mustStatus(http.StatusCreated, status, body)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	statuses := make([]int, 2)
+	bodies := make([]map[string]any, 2)
+	bases := []string{a, b}
+	for i := 0; i < 2; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			statuses[i], bodies[i] = f.reportFault(bases[i], c[2+i], "9.0.0", 2)
+		}()
+	}
+	wg.Wait()
+
+	created, conflict := 0, 0
+	for i, st := range statuses {
+		switch st {
+		case http.StatusCreated:
+			created++
+			if bodies[i]["triggered"] != true {
+				t.Fatalf("winning report must trigger action: %v", bodies[i])
+			}
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("unexpected third-report status %d body=%v", st, bodies[i])
+		}
+	}
+	if created != 1 || conflict != 1 {
+		t.Fatalf("want one trigger and one conflict, got %d/%d", created, conflict)
+	}
+	if countRows(f, "generations") != 3 || countRows(f, "fault_actions") != 1 ||
+		reportCount(f, 2) != 3 {
+		t.Fatalf("race must not duplicate generation/action/report state")
+	}
+	status, cur := f.do(http.MethodGet, a, "/v1/current", nil)
+	f.mustStatus(http.StatusOK, status, cur)
+	if asInt64(cur["gen"]) != 3 || cur["kind"] != "fault_disable" {
+		t.Fatalf("current must be sole fault_disable gen: %v", cur)
+	}
+}
+
+func TestFaultReportAndManualGenerationCommitSerialize(t *testing.T) {
+	f := newFixture(t)
+	a := f.baseURL()
+	b := f.newServer()
+
+	pkg1 := f.freeze(snap("v1"))
+	f.mustPublishOK(a, pkg1, 100, "1.0.0", 0)
+	pkg2 := f.freeze(snap("v2"))
+	f.mustPublishOK(a, pkg2, 100, "1.0.0", 1)
+	for _, id := range []string{"manual-fault-a", "manual-fault-b"} {
+		status, body := f.reportFault(a, id, "9.0.0", 2)
+		f.mustStatus(http.StatusCreated, status, body)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var faultStatus, adjustStatus int
+	var faultBody, adjustBody map[string]any
+	go func() {
+		defer wg.Done()
+		faultStatus, faultBody = f.reportFault(a, "manual-fault-c", "9.0.0", 2)
+	}()
+	go func() {
+		defer wg.Done()
+		adjustStatus, adjustBody = f.do(http.MethodPost, b, "/v1/adjust", map[string]any{
+			"trial_percent": 50, "expected_gen": 2,
+		})
+	}()
+	wg.Wait()
+
+	if (faultStatus == http.StatusConflict) == (adjustStatus == http.StatusConflict) {
+		t.Fatalf("database must choose exactly one order: fault=%d(%v) adjust=%d(%v)",
+			faultStatus, faultBody, adjustStatus, adjustBody)
+	}
+	if countRows(f, "generations") != 3 {
+		t.Fatalf("interleaved writes must create exactly one next generation")
+	}
+
+	// 负方按旧 expected_gen 重试仍是可重试冲突，不允许补造重复代次。
+	status, cur := f.do(http.MethodGet, a, "/v1/current", nil)
+	f.mustStatus(http.StatusOK, status, cur)
+	if asInt64(cur["gen"]) != 3 {
+		t.Fatalf("current gen should be the sole winner: %v", cur)
+	}
+	status, body := f.do(http.MethodPost, a, "/v1/adjust", map[string]any{
+		"trial_percent": 60, "expected_gen": 2,
+	})
+	f.mustStatus(http.StatusConflict, status, body)
+	if countRows(f, "generations") != 3 {
+		t.Fatalf("rejected stale retry must not create a generation")
+	}
+}
+
+func TestFaultReportAndRollbackSerialize(t *testing.T) {
+	f := newFixture(t)
+	a := f.baseURL()
+	b := f.newServer()
+
+	pkg1 := f.freeze(snap("v1"))
+	f.mustPublishOK(a, pkg1, 100, "1.0.0", 0)
+	pkg2 := f.freeze(snap("v2"))
+	f.mustPublishOK(a, pkg2, 100, "1.0.0", 1)
+	for _, id := range []string{"rollback-fault-a", "rollback-fault-b"} {
+		status, body := f.reportFault(a, id, "9.0.0", 2)
+		f.mustStatus(http.StatusCreated, status, body)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var faultStatus, rollbackStatus int
+	var faultBody, rollbackBody map[string]any
+	go func() {
+		defer wg.Done()
+		faultStatus, faultBody = f.reportFault(a, "rollback-fault-c", "9.0.0", 2)
+	}()
+	go func() {
+		defer wg.Done()
+		rollbackStatus, rollbackBody = f.do(http.MethodPost, b, "/v1/rollback", map[string]any{
+			"gen": 1, "expected_gen": 2,
+		})
+	}()
+	wg.Wait()
+
+	if (faultStatus == http.StatusConflict) == (rollbackStatus == http.StatusConflict) {
+		t.Fatalf("database must choose exactly one order: fault=%d(%v) rollback=%d(%v)",
+			faultStatus, faultBody, rollbackStatus, rollbackBody)
+	}
+	if countRows(f, "generations") != 3 {
+		t.Fatalf("fault/rollback race must create exactly one next generation")
+	}
+	status, cur := f.do(http.MethodGet, a, "/v1/current", nil)
+	f.mustStatus(http.StatusOK, status, cur)
+	if asInt64(cur["gen"]) != 3 {
+		t.Fatalf("current gen should be the sole winner: %v", cur)
+	}
+}
+
+func TestFaultTransactionFailureLeavesNoPartialRecords(t *testing.T) {
+	f := newFixture(t)
+	base := f.baseURL()
+
+	pkg1 := f.freeze(snap("v1"))
+	f.mustPublishOK(base, pkg1, 100, "1.0.0", 0)
+	pkg2 := f.freeze(snap("v2"))
+	f.mustPublishOK(base, pkg2, 100, "1.0.0", 1)
+	for _, id := range []string{"fail-fault-a", "fail-fault-b"} {
+		status, body := f.reportFault(base, id, "9.0.0", 2)
+		f.mustStatus(http.StatusCreated, status, body)
+	}
+
+	// 在真实 PostgreSQL 中向第三条证据写入注入失败；整个 ReportFault 事务必须回滚。
+	_, err := f.db.Exec(`
+        DROP TRIGGER IF EXISTS trg_inject_third_fault_failure ON fault_reports;
+        CREATE OR REPLACE FUNCTION inject_third_fault_failure() RETURNS trigger AS $$
+        BEGIN
+            IF (SELECT count(*) FROM fault_reports WHERE gen = NEW.gen) >= 3 THEN
+                RAISE EXCEPTION 'injected third-report transaction failure'
+                    USING ERRCODE = 'P0001';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER trg_inject_third_fault_failure
+            AFTER INSERT ON fault_reports
+            FOR EACH ROW EXECUTE FUNCTION inject_third_fault_failure();`)
+	if err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.db.Exec(`
+            DROP TRIGGER IF EXISTS trg_inject_third_fault_failure ON fault_reports;
+            DROP FUNCTION IF EXISTS inject_third_fault_failure();`)
+	})
+
+	status, body := f.reportFault(base, "fail-fault-c", "9.0.0", 2)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("injected failure should surface as 500, got %d body=%v", status, body)
+	}
+	if _, err := f.db.Exec(`
+        DROP TRIGGER trg_inject_third_fault_failure ON fault_reports;
+        DROP FUNCTION inject_third_fault_failure();`); err != nil {
+		t.Fatalf("remove failure trigger: %v", err)
+	}
+
+	if reportCount(f, 2) != 2 {
+		t.Fatalf("rolled-back third report must not remain")
+	}
+	if countRows(f, "fault_actions") != 0 || countRows(f, "fault_action_reports") != 0 {
+		t.Fatalf("rolled-back action evidence must not remain")
+	}
+	if countRows(f, "generations") != 2 {
+		t.Fatalf("rolled-back fault_disable generation must not remain")
+	}
+	status, cur := f.do(http.MethodGet, base, "/v1/current", nil)
+	f.mustStatus(http.StatusOK, status, cur)
+	if asInt64(cur["gen"]) != 2 {
+		t.Fatalf("current pointer must remain at gen2 after rollback: %v", cur)
+	}
+
+	// 修复后第三条仍可正常触发，证明前一次失败没有留下半份状态。
+	status, body = f.reportFault(base, "fail-fault-c", "9.0.0", 2)
+	mustCreated(f, status, body)
+	if body["triggered"] != true || asInt64(body["fault_action"].(map[string]any)["new_gen"]) != 3 {
+		t.Fatalf("retry after rolled-back failure should trigger gen3: %v", body)
+	}
+}
+
+func reportCount(f *fixture, gen int64) int {
+	f.t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT count(*) FROM fault_reports WHERE gen=$1`, gen).Scan(&n); err != nil {
+		f.t.Fatalf("count fault_reports: %v", err)
+	}
+	return n
+}
+
+func countRows(f *fixture, table string) int {
+	f.t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+		f.t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
 type decision struct {
 	gen, pkg, bucket int64
 	trial, fallback  bool

@@ -1,5 +1,5 @@
-// Package api 组装 HTTP 路由。所有写操作都显式携带 expected_gen，
-// 由存储层的行锁 + 代次比较保证并发安全。
+// Package api 组装 HTTP 路由。人工写操作显式携带 expected_gen，
+// 故障上报携带 observed_gen，由存储层的行锁 + 代次比较保证并发安全。
 package api
 
 import (
@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"configrelease/internal/config"
 	"configrelease/internal/resolve"
@@ -51,6 +52,10 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /v1/publish", s.publish)
 	m.HandleFunc("POST /v1/adjust", s.adjust)
 	m.HandleFunc("POST /v1/rollback", s.rollback)
+
+	// 按发布代次登记客户端故障；第三个有效客户端会原子追加 0% 的 fault_disable 代次。
+	m.HandleFunc("POST /v1/fault-reports", s.reportFault)
+	m.HandleFunc("GET /v1/generations/{gen}/fault-action", s.getFaultAction)
 
 	m.HandleFunc("GET /v1/current", s.current)
 	m.HandleFunc("GET /v1/generations", s.listGenerations)
@@ -319,6 +324,73 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, genResponse(gen))
+}
+
+func (s *Server) reportFault(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ClientID      string `json:"client_id"`
+		ClientVersion string `json:"client_version"`
+		ObservedGen   int64  `json:"observed_gen"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+
+	ve := &validationErrs{}
+	if strings.TrimSpace(body.ClientID) == "" || len(body.ClientID) > 256 {
+		ve.add("client_id", "is required and must be at most 256 bytes")
+	}
+	ver, msg := parseSemVer(body.ClientVersion)
+	if msg != "" {
+		ve.add("client_version", msg)
+	}
+	if body.ObservedGen <= 0 {
+		ve.add("observed_gen", "must reference the generation seen by the client")
+	}
+	if !ve.flush(w) {
+		return
+	}
+	body.ClientID = strings.TrimSpace(body.ClientID)
+
+	result, err := s.store.ReportFault(r.Context(), store.FaultReportInput{
+		ObservedGen: body.ObservedGen,
+		ClientID:    body.ClientID,
+		Version:     ver,
+	})
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+
+	status := http.StatusCreated
+	if result.Duplicate {
+		// 幂等：同一客户端对同一代次重复上报不产生第二条记录。
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{
+		"duplicate": result.Duplicate,
+		"triggered": result.Triggered,
+		"report":    result.Report,
+		"fault_action": func() any {
+			if result.Action == nil {
+				return nil
+			}
+			return faultActionResponse(*result.Action)
+		}(),
+	})
+}
+
+func (s *Server) getFaultAction(w http.ResponseWriter, r *http.Request) {
+	gen, ok := pathInt64(w, r, "gen")
+	if !ok {
+		return
+	}
+	action, err := s.store.GetFaultActionByTriggerGen(r.Context(), gen)
+	if err != nil {
+		writeStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, faultActionResponse(action))
 }
 
 func (s *Server) current(w http.ResponseWriter, r *http.Request) {

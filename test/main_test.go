@@ -205,6 +205,15 @@ func (f *fixture) resolve(base, clientID, ver string) (int, map[string]any) {
 		"/v1/resolve?client_id="+url.QueryEscape(clientID)+"&client_version="+url.QueryEscape(ver), nil)
 }
 
+// reportFault 以客户端实际看到的代次提交故障。
+func (f *fixture) reportFault(base, clientID, ver string, observedGen int64) (int, map[string]any) {
+	return f.do(http.MethodPost, base, "/v1/fault-reports", map[string]any{
+		"client_id":      clientID,
+		"client_version": ver,
+		"observed_gen":   observedGen,
+	})
+}
+
 // ---- 构造数据 ----
 
 func snap(version string) config.Snapshot {

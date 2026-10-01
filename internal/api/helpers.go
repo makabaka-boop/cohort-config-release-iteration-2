@@ -28,6 +28,18 @@ func genResponse(g store.GenerationView) map[string]any {
 	}
 }
 
+// faultActionResponse 展示自动停用的完整触发依据（三条故障上报）与新代次。
+func faultActionResponse(a store.FaultAction) map[string]any {
+	return map[string]any{
+		"trigger_gen":     a.TriggerGen,
+		"new_gen":         a.NewGen,
+		"third_report_id": a.ThirdReportID,
+		"created_at":      a.CreatedAt,
+		"reports":         a.Reports,
+		"new_generation":  genResponse(a.NewGeneration),
+	}
+}
+
 // validationErrs 累积请求字段错误。
 type validationErrs struct {
 	fields []config.FieldError
@@ -113,6 +125,12 @@ func writeStoreError(w http.ResponseWriter, r *http.Request, err error) {
 		writeAppError(w, http.StatusNotFound, "package_not_found", "package does not exist")
 	case errors.Is(err, store.ErrGenerationNotFound):
 		writeAppError(w, http.StatusNotFound, "generation_not_found", "generation does not exist")
+	case errors.Is(err, store.ErrFaultActionNotFound):
+		writeAppError(w, http.StatusNotFound, "fault_action_not_found",
+			"no automatic fault disable was triggered for this generation")
+	case errors.Is(err, store.ErrFaultReportInvalid):
+		writeAppError(w, http.StatusUnprocessableEntity, "fault_report_invalid",
+			"the reported client did not receive that generation's trial package under its bucket and version rules")
 	case errors.Is(err, store.ErrNoCurrent):
 		writeAppError(w, http.StatusServiceUnavailable, "no_current",
 			"no configuration has been published yet")
